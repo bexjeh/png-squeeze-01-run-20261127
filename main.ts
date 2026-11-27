@@ -1,10 +1,13 @@
 // png-squeeze: losslessly re-encode 1280x720 RGBA screenshots as the smallest PNG.
 // Own design: colour-type reduction (palette / grey / grey+alpha / RGB / RGBA, with a
 // tRNS key when a single fully-transparent value can stand in for an alpha channel),
-// per-row filter choice by minimum signed sum, and a from-scratch optimal-parsing
-// DEFLATE (shortest-path LZ77 with hash chains, dynamic Huffman built by
-// package-merge, fixed Huffman as the fallback) in pure JavaScript. Deterministic:
-// no clock, no randomness, no environment-dependent branching anywhere.
+// per-row filter choice by minimum signed sum / fewest pairs, and a from-scratch
+// optimal-parsing DEFLATE (shortest-path LZ77 with hash chains up to 1024 deep where
+// the seed path says it matters -- shorter chains and fewer windows on dense,
+// photo-like blocks, where the deep search costs the most per byte saved --
+// dynamic Huffman, fixed Huffman as the fallback)
+// in pure JavaScript. Deterministic: no clock, no randomness, no
+// environment-dependent branching anywhere.
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -458,6 +461,7 @@ class BitWriter {
 const HASH_BITS = 16;
 const HASH_SIZE = 1 << HASH_BITS;
 const MAX_CHAIN = 64;
+const WINDOW = 8;
 const MAX_MATCH = 258;
 const MIN_MATCH = 3;
 // Greedy longest-match parse: walk the data, take the longest match at each
@@ -473,9 +477,9 @@ function greedyParse(data, head, prev) {
     let best = 0, bestd = 0;
     if (i + 2 < data.length) {
       const h = (Math.imul((data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2], 2654435761) >>> 17) & (HASH_SIZE - 1);
-      let cur = head[h], tried = 0;
+      let cur = head[h], tried = 0, limit = MAX_CHAIN;
       const maxLen = Math.min(MAX_MATCH, data.length - i);
-      while (cur !== -1 && tried < MAX_CHAIN) {
+      while (cur !== -1 && tried < limit) {
         const d = i - cur;
         if (d > 32768) break;
         if (best < maxLen && data[cur + best] === data[i + best]) {
@@ -483,7 +487,14 @@ function greedyParse(data, head, prev) {
           while (len < maxLen && data[cur + len] === data[i + len]) len++;
           let ok = true;
           for (let k = 0; k < best; k++) if (data[cur + k] !== data[i + k]) { ok = false; break; }
-          if (ok && len > best) { best = len; bestd = d; if (len === MAX_MATCH) break; }
+          if (ok && len > best) {
+            best = len; bestd = d;
+            if (len >= 128) limit = Math.min(limit, tried + 2);
+            else if (len >= 64) limit = Math.min(limit, tried + 8);
+            else if (len >= 32) limit = Math.min(limit, tried + 32);
+            else if (len >= 16) limit = Math.min(limit, tried + 128);
+            if (len === MAX_MATCH) break;
+          }
         }
         cur = prev[cur]; tried++;
       }
@@ -502,7 +513,7 @@ function greedyParse(data, head, prev) {
   }
   return syms;
 }
-function parseBlock(data, litLen, distLen, head, prev) {
+function parseBlock(data, litLen, distLen, head, prev, deepAt, shallowExit = true, deepChain = 1024) {
   const n = data.length;
   const cost = new Float64Array(n + 1);
   cost.fill(Infinity);
@@ -534,11 +545,14 @@ function parseBlock(data, litLen, distLen, head, prev) {
     // Matches.
     if (i + MIN_MATCH <= n) {
       const h = (Math.imul((data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2], 2654435761) >>> 17) & (HASH_SIZE - 1);
+      const deep = deepAt !== null && deepAt[i] === 1;
+      const maxChain = deep ? deepChain : MAX_CHAIN;
       let cur = head[h];
       let tried = 0;
       let bestLen = 0;
+      let limit = maxChain;
       const maxLen = Math.min(MAX_MATCH, n - i);
-      while (cur !== -1 && tried < MAX_CHAIN) {
+      while (cur !== -1 && tried < limit) {
         const dist = i - cur;
         if (dist > 32768) break;
         // A candidate can only beat the best length if its byte at bestLen
@@ -552,6 +566,20 @@ function parseBlock(data, litLen, distLen, head, prev) {
             for (let k = 0; k < bestLen; k++) if (data[cur + k] !== data[i + k]) { ok = false; break; }
             if (ok) {
               bestLen = len;
+              if (!deep && shallowExit) {
+                // Shallow positions: a long match at a close distance is
+                // nearly final (a later candidate is farther, so it can only
+                // win by length, and only a little); a long match far away
+                // is still worth improving on (a closer one saves distance
+                // bits). Positions with no match at all after many tries
+                // are cut off too: a short match far away is worth no more
+                // than the literals it replaces.
+                if (len >= 32 && dist <= 256) limit = Math.min(limit, tried + 4);
+                else if (len >= 128 && dist <= 2048) limit = Math.min(limit, tried + 16);
+                else if (len >= 64) limit = Math.min(limit, tried + 128);
+                else if (len >= 32) limit = Math.min(limit, tried + 256);
+                else if (len >= 16) limit = Math.min(limit, tried + 512);
+              }
               const dc = distCodeOf(dist);
               // A match of length len at this distance also offers every
               // shorter length at the same distance. Within one length-code
@@ -571,6 +599,7 @@ function parseBlock(data, litLen, distLen, head, prev) {
         }
         cur = prev[cur];
         tried++;
+        if (!deep && shallowExit && tried >= 256 && bestLen < 3) break;
       }
       prev[i] = head[h]; head[h] = i;
     }
@@ -594,6 +623,35 @@ function parseBlock(data, litLen, distLen, head, prev) {
     }
   }
   return syms;
+}
+
+// Mark the positions where the optimal parse deserves the deep chain search:
+// a window around every match start of the greedy parse (the optimal path
+// starts its matches within a few bytes of the greedy path's), and every
+// long literal run of the greedy parse (where a deep match may exist that
+// the greedy search missed). Everywhere else the shallow chain is enough.
+function markDeep(gSyms, n, minLen) {
+  const deepAt = new Uint8Array(n);
+  const mark = (a, b) => {
+    a = Math.max(0, a); b = Math.min(n - 1, b);
+    for (let p = a; p <= b; p++) deepAt[p] = 1;
+  };
+  let pos = 0, runStart = -1, runLen = 0;
+  for (let k = 0; k < gSyms.length; k += 3) {
+    const s = gSyms[k], e = gSyms[k + 1];
+    if (s <= 256) {
+      if (runStart === -1) { runStart = pos; runLen = 0; }
+      runLen++; pos++;
+    } else {
+      if (runLen >= 4) mark(runStart - 4, runStart + runLen + 3);
+      runStart = -1; runLen = 0;
+      const len = LEN_BASE[s - 257] + e;
+      if (len >= minLen) mark(pos - WINDOW, pos + WINDOW);
+      pos += len;
+    }
+  }
+  if (runLen >= 4) mark(runStart - 4, runStart + runLen + 3);
+  return deepAt;
 }
 // Emit one block's symbols with the given Huffman tables.
 function emitBlock(bw, syms, isFinal, litCodes, litLen, distCodes, distLen, dynamic) {
@@ -680,46 +738,51 @@ function adler32(bytes) {
   }
   return ((b << 16) | a) >>> 0;
 }
-const BLOCK = 1048576;
-// Compress one block two ways (fixed Huffman from a fixed-cost parse, dynamic
-// Huffman from a second parse under the dynamic costs) and write the smaller
-// into the shared bit writer. Blocks are bit-packed back to back: only the
-// stream's last block is aligned to a byte boundary, never a block in the middle.
-function deflateBlock(data, isFinal, head, prev, bw, useGreedyFreq) {
-  // The frequency source for the dynamic tables, and the fixed-block
-  // candidate: a greedy parse (cheap) for palette data, where the shortest
-  // path gains little, or a shortest-path parse under the fixed tables for
-  // channel data, where it gains the most. The caller chooses by form.
-  const fixedSyms = useGreedyFreq
-    ? greedyParse(data, head, prev)
-    : parseBlock(data, FIXED_LIT_LEN, FIXED_DIST_LEN, head, prev);
+const BLOCK = 524288;
+// Compress one block: the seed parse's symbols give the dynamic Huffman
+// tables and the deep-search windows (see markDeep). Filtered data is seeded
+// by a shortest-path parse under the fixed tables (its frequencies are far
+// closer to the optimal parse's than a greedy parse's are there); unfiltered
+// data, where long matches dominate and the greedy parse is already nearly
+// optimal, is seeded by the cheap greedy parse. One shortest-path parse under
+// the dynamic tables follows, with the deep hash chain only at the marked
+// positions. The fixed block from the seed symbols is the fallback candidate.
+// The winner is re-coded once with tables built from its own symbols. Blocks
+// are bit-packed back to back: only the stream's last block is aligned.
+function deflateBlock(data, isFinal, head, prev, bw, useFixedSeed) {
+  const seedSyms = useFixedSeed
+    ? parseBlock(data, FIXED_LIT_LEN, FIXED_DIST_LEN, head, prev, null, false)
+    : greedyParse(data, head, prev);
   const { codes: fLitCodes } = codesFromLengths(FIXED_LIT_LEN);
   const { codes: fDistCodes } = codesFromLengths(FIXED_DIST_LEN);
   const bwFixed = new BitWriter(data.length * 2 + 4096);
-  emitBlock(bwFixed, fixedSyms, isFinal, fLitCodes, FIXED_LIT_LEN, fDistCodes, FIXED_DIST_LEN, false);
+  emitBlock(bwFixed, seedSyms, isFinal, fLitCodes, FIXED_LIT_LEN, fDistCodes, FIXED_DIST_LEN, false);
   const fixedBits = bwFixed.bitsWritten();
-  // Frequencies from the first parse's symbols.
   const litFreq = new Uint32Array(288);
   const distFreq = new Uint32Array(30);
-  for (let k = 0; k < fixedSyms.length; k += 3) {
-    litFreq[fixedSyms[k]]++;
-    if (fixedSyms[k] >= 257) distFreq[distCodeOf(fixedSyms[k + 2])]++;
+  for (let k = 0; k < seedSyms.length; k += 3) {
+    litFreq[seedSyms[k]]++;
+    if (seedSyms[k] >= 257) distFreq[distCodeOf(seedSyms[k + 2])]++;
   }
   litFreq[256]++; // end of block
-  // A Huffman alphabet needs at least two symbols with a code, and a dynamic
-  // block's distance code must be complete: pad dummies until both hold.
-  let litUsed = 0, distUsed = 0;
-  for (let s = 0; s < 288; s++) if (litFreq[s] > 0) litUsed++;
+  let distUsed = 0;
   for (let s = 0; s < 30; s++) if (distFreq[s] > 0) distUsed++;
-  if (litUsed < 2) { for (let s = 0; s < 288; s++) if (litFreq[s] === 0) { litFreq[s] = 1; break; } }
   while (distUsed < 2) {
     for (let s = 0; s < 30; s++) if (distFreq[s] === 0) { distFreq[s] = 1; distUsed++; break; }
   }
   const dynLitLen = huffmanLengths(litFreq, 15);
   const dynDistLen = huffmanLengths(distFreq, 15);
-  const dynSyms = parseBlock(data, dynLitLen, dynDistLen, head, prev);
-  // Safety: the second parse must only use symbols the tables cover. If it
-  // ever did not (a length code the first parse never used), keep the fixed block.
+  // Density of this block, from the seed parse: the average match length.
+  // Dense blocks (short matches, photo-like detail) cost the most deep-search
+  // time per byte saved, so they take the short deep chain and windows only
+  // around matches of 8 bytes or more; sparse blocks take the full deep search.
+  let matchBytes = 0, matches = 0;
+  for (let k = 0; k < seedSyms.length; k += 3) {
+    if (seedSyms[k] > 256) { matches++; matchBytes += LEN_BASE[seedSyms[k] - 257] + seedSyms[k + 1]; }
+  }
+  const dense = matches > 0 && matchBytes / matches < 20;
+  const deepAt = markDeep(seedSyms, data.length, dense ? 8 : 0);
+  const dynSyms = parseBlock(data, dynLitLen, dynDistLen, head, prev, deepAt, true, dense ? 256 : 1024);
   let dynOk = true;
   for (let k = 0; k < dynSyms.length; k += 3) {
     if (dynLitLen[dynSyms[k]] === 0) { dynOk = false; break; }
@@ -733,10 +796,6 @@ function deflateBlock(data, isFinal, head, prev, bw, useGreedyFreq) {
     const bwDyn = new BitWriter(data.length * 2 + 4096);
     emitBlock(bwDyn, dynSyms, isFinal, dLitCodes, dynLitLen, dDistCodes, dynDistLen, true);
     dynBits = bwDyn.bitsWritten();
-    // Re-code the same dynamic symbols with tables built from their own
-    // frequencies: the first tables came from the first parse, which is not
-    // the parse being coded, so its own tables are never worse in code
-    // length (the header may cost a little more; the smaller emission wins).
     const lf2 = new Uint32Array(288), df2 = new Uint32Array(30);
     for (let k = 0; k < dynSyms.length; k += 3) {
       lf2[dynSyms[k]]++;
@@ -763,19 +822,17 @@ function deflateBlock(data, isFinal, head, prev, bw, useGreedyFreq) {
       }
     }
   }
-  // Re-emit the winner into the shared writer (emitting is cheap; parsing is not).
   if (dynBits < fixedBits) emitBlock(bw, dynSyms, isFinal, dLitCodesW, dynLitLenW, dDistCodesW, dynDistLenW, true);
-  else emitBlock(bw, fixedSyms, isFinal, fLitCodes, FIXED_LIT_LEN, fDistCodes, FIXED_DIST_LEN, false);
+  else emitBlock(bw, seedSyms, isFinal, fLitCodes, FIXED_LIT_LEN, fDistCodes, FIXED_DIST_LEN, false);
 }
-// A zlib stream (header 0x78 0x9c, deflate blocks, Adler-32) of the raw data.
-function deflateData(data, useGreedyFreq) {
+function deflateData(data, useFixedSeed) {
   const head = new Int32Array(HASH_SIZE);
   const prev = new Int32Array(data.length);
   const bw = new BitWriter(data.length * 2 + 4096);
   const nBlocks = Math.max(1, Math.ceil(data.length / BLOCK));
   for (let b = 0; b < nBlocks; b++) {
     const chunk = data.subarray(b * BLOCK, Math.min(data.length, (b + 1) * BLOCK));
-    deflateBlock(chunk, b === nBlocks - 1, head, prev, bw, useGreedyFreq);
+    deflateBlock(chunk, b === nBlocks - 1, head, prev, bw, useFixedSeed);
   }
   bw.align();
   const body = bw.bytes();
@@ -797,21 +854,19 @@ function encodeImage(rgba) {
     // index values; the minimum-sum and fewest-pairs choices win on channel
     // data. All four variants come from one fused pass over the rows.
     const v = filteredVariants(form.samples, WIDTH, HEIGHT, form.bpp);
-    const variants = [v.filter0, v.minsum];
-    if (form.colourType !== 3) variants.push(v.paeth, v.pairs);
+    const variants = [['filter0', v.filter0], ['minsum', v.minsum]];
+    if (form.colourType !== 3) variants.push(['paeth', v.paeth], ['pairs', v.pairs]);
     const chunkBytes = (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
-    for (const raw of variants) {
+    for (const [variant, raw] of variants) {
       const z = deflateSync(raw, { level: 6, memLevel: 9 });
       const bytes = z.length + chunkBytes;
-      if (best === null || bytes < best.bytes) best = { form, raw, bytes, chunkBytes };
+      if (best === null || bytes < best.bytes) best = { form, raw, bytes, chunkBytes, variant };
     }
   }
-  const { form, raw, chunkBytes } = best;
-  // Palette rows are short (one byte per pixel) and the shortest-path parse
-  // gains almost nothing over the greedy frequency estimate there, so they
-  // take the cheap greedy path; channel rows take the two-parse path, where
-  // the fixed-parse frequencies are worth the extra work.
-  const mine = deflateData(raw, form.colourType === 3);
+  const { form, raw, chunkBytes, variant } = best;
+  // The own optimal-parsing deflate (greedy-seeded, windowed deep search);
+  // zlib level 9 stays the fallback when it is smaller.
+  const mine = deflateData(raw, variant !== 'filter0');
   const z9 = deflateSync(raw, { level: 9, memLevel: 9 });
   const idat = mine.length <= z9.length ? mine : z9;
   const chunks = [['IHDR', ihdrOf(WIDTH, HEIGHT, form.colourType)]];
